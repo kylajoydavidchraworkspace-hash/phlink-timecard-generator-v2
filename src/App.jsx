@@ -1,0 +1,138 @@
+import React, { useState } from "react";
+import * as XLSX from "xlsx";
+import { saveAs } from "file-saver";
+import dayjs from "dayjs";
+
+export default function App(){
+  const [cutoff, setCutoff] = useState("whole");
+  const [message, setMessage] = useState("");
+  const [fileName, setFileName] = useState("");
+  const brandName = "Phlink Support Timecard Generator";
+
+  const findColumn = (headers, candidates) => {
+    const lower = headers.map((h)=>String(h).toLowerCase());
+    for(const c of candidates){
+      const idx = lower.indexOf(c.toLowerCase());
+      if(idx !== -1) return headers[idx];
+    }
+    return null;
+  };
+
+  const formatTimes = (timesArr) => {
+    const times = timesArr.map(t=>String(t).trim()).filter(Boolean);
+    if(times.length===2) return [times[0],"","",times[1],"",""];
+    if(times.length===4) return [times[0],times[1],times[2],times[3],"",""];
+    const filled = times.slice(0,6);
+    while(filled.length<6) filled.push("");
+    return filled;
+  };
+
+  const dateRange = (start,end)=>{
+    const s = dayjs(start); const e = dayjs(end); const arr=[];
+    for(let d=s; d.isBefore(e) || d.isSame(e); d=d.add(1,"day")) arr.push(d.format("YYYY-MM-DD"));
+    return arr;
+  };
+
+  const handleFile = async(e)=>{
+    const file = e.target.files?.[0]; if(!file) return;
+    setFileName(file.name); setMessage("Processing... please wait");
+    try{
+      const data = await file.arrayBuffer();
+      const workbook = XLSX.read(data,{type:"array"});
+      const sheetName = workbook.SheetNames[0];
+      const ws = workbook.Sheets[sheetName];
+      const raw = XLSX.utils.sheet_to_json(ws,{header:1});
+      if(raw.length<2){ setMessage("Uploaded file looks empty or doesn't have expected structure."); return; }
+      const headers = raw[0].map(h=>(h===null||h===undefined)?"":String(h).trim());
+      const empCol = findColumn(headers,["employee id","employeeid","id"]);
+      const nameCol = findColumn(headers,["name","first name","firstname","employee name"]);
+      const deptCol = findColumn(headers,["department","dept"]);
+      const dateCol = findColumn(headers,["date","transaction date"]);
+      const timeCol = findColumn(headers,["time","timestamp"]);
+      if(!empCol||!nameCol||!deptCol||!dateCol||!timeCol){ setMessage("Could not detect required columns. Ensure headers: Employee ID, Name, Department, Date, Time."); return; }
+      const rows = raw.slice(1).map(r=>{ const obj={}; headers.forEach((h,i)=>obj[h]=r[i]??""); return obj; });
+      const map = new Map();
+      rows.forEach(r=>{
+        const empId = String(r[empCol]??"").trim();
+        const name = String(r[nameCol]??"").trim();
+        const dept = String(r[deptCol]??"").trim();
+        let date = r[dateCol];
+        if(date instanceof Date) date = dayjs(date).format("YYYY-MM-DD"); else date = dayjs(String(date).trim()).format("YYYY-MM-DD");
+        if(!date||date==="Invalid date") return;
+        const time = String(r[timeCol]??"").trim();
+        const key = `${empId}||${name}||${dept}`;
+        if(!map.has(key)) map.set(key,{});
+        const person = map.get(key);
+        if(!person[date]) person[date]=[];
+        if(time) person[date].push(time);
+      });
+      const allDates = new Set();
+      for(const [,person] of map) Object.keys(person).forEach(d=>allDates.add(d));
+      if(allDates.size===0){ setMessage("No valid dates found in file."); return; }
+      const sortedDates = Array.from(allDates).sort();
+      const earliest = sortedDates[0];
+      const year = dayjs(earliest).year(); const month = dayjs(earliest).month()+1;
+      const startOfMonth = dayjs(`${year}-${String(month).padStart(2,"0")}-01`);
+      const endOfMonth = startOfMonth.endOf("month");
+      let datesToUse = [];
+      if(cutoff==="first") datesToUse = dateRange(startOfMonth.format("YYYY-MM-DD"), startOfMonth.add(14,"day").format("YYYY-MM-DD"));
+      else if(cutoff==="second") datesToUse = dateRange(startOfMonth.add(15,"day").format("YYYY-MM-DD"), endOfMonth.format("YYYY-MM-DD"));
+      else datesToUse = dateRange(startOfMonth.format("YYYY-MM-DD"), endOfMonth.format("YYYY-MM-DD"));
+      const outputRows = [];
+      for(const [key,person] of map.entries()){
+        const [empId,name,dept] = key.split("||");
+        for(const d of datesToUse){
+          const times = person[d] ?? [];
+          const sortedTimes = times.slice().sort();
+          const [t1,t2,t3,t4,t5,t6] = formatTimes(sortedTimes);
+          outputRows.push({"Employee ID":empId,"Name":name,"Department":dept,"Date":d,"Time 1":t1,"Time 2":t2,"Time 3":t3,"Time 4":t4,"Time 5":t5,"Time 6":t6});
+        }
+      }
+      const wsOut = XLSX.utils.json_to_sheet(outputRows,{header:["Employee ID","Name","Department","Date","Time 1","Time 2","Time 3","Time 4","Time 5","Time 6"]});
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, wsOut, "Formatted Timecard");
+      const meta = [{Key:"Generated By",Value:brandName},{Key:"Cutoff",Value:cutoff}];
+      const wsMeta = XLSX.utils.json_to_sheet(meta);
+      XLSX.utils.book_append_sheet(wb, wsMeta, "Info");
+      const wbout = XLSX.write(wb,{bookType:"xlsx",type:"array"});
+      const outName = `Formatted_Timecard_${dayjs().format("YYYYMMDD_HHmmss")}.xlsx`;
+      saveAs(new Blob([wbout],{type:"application/octet-stream"}), outName);
+      setMessage(`Generated ${outName} — ${outputRows.length} rows.`);
+    }catch(err){
+      console.error(err); setMessage("Error processing file: "+String(err));
+    }
+  };
+
+  return (
+    <div className="container" style={{padding:24}}>
+      <header style={{display:'flex',gap:16,alignItems:'center',marginBottom:16}}>
+        <div style={{width:84,height:84,background:'#d92b1f',borderRadius:8,overflow:'hidden',display:'flex',alignItems:'center',justifyContent:'center'}}>
+          <img src="/logo.png" alt="logo" style={{width:'100%',height:'100%',objectFit:'contain'}} />
+        </div>
+        <div>
+          <h1 style={{margin:0}}>{brandName}</h1>
+          <p style={{margin:0,color:'#666'}}>Phlink Support Timecard Generator</p>
+        </div>
+      </header>
+      <section style={{marginBottom:12}}>
+        <label style={{display:'block',marginBottom:8}}>Upload transaction .xlsx (first sheet will be read)</label>
+        <input type="file" accept=".xlsx,.xls,.csv" onChange={handleFile} />
+      </section>
+      <section style={{marginBottom:12}}>
+        <label style={{display:'block',marginBottom:8}}>Cutoff option</label>
+        <div style={{display:'flex',gap:8}}>
+          <label><input type="radio" name="cutoff" value="first" checked={cutoff==='first'} onChange={()=>setCutoff('first')} /> 1st cutoff (1-15)</label>
+          <label><input type="radio" name="cutoff" value="second" checked={cutoff==='second'} onChange={()=>setCutoff('second')} /> 2nd cutoff (16-end)</label>
+          <label><input type="radio" name="cutoff" value="whole" checked={cutoff==='whole'} onChange={()=>setCutoff('whole')} /> Whole month</label>
+        </div>
+      </section>
+      <section style={{marginBottom:12}}>
+        <p style={{margin:0}}><strong>Note:</strong> All dates in the selected cutoff will be present for every employee. Missing timestamps remain blank. Timestamp rules: 2 → Time1 & Time4, 4 → Time1–4.</p>
+      </section>
+      <footer style={{marginTop:20,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+        <div style={{color:'#333'}}>{message}</div>
+        <div style={{color:'#666',fontSize:12}}>{fileName || 'No file selected'}</div>
+      </footer>
+    </div>
+  );
+}
